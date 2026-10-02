@@ -1,15 +1,20 @@
+from django.db import IntegrityError, transaction
 from django.db.models import Exists, OuterRef, Prefetch
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from .models import (
-    Binding, Issue, IssueNumber, IssueNumbering, Item, Title,
-    locate_number, number_holding_status,
+    Binding, Issue, IssueNumber, IssueNumbering, Item,
+    PreservationOrder, Title,
+    item_locate_dict, item_preservation_dict, locate_number,
+    number_holding_status,
 )
 from .serializers import (
     BindingSerializer, IssueSerializer, ItemSerializer,
-    IssueNumberSerializer, TitleSerializer, UnbindSerializer,
+    IssueNumberSerializer, PreservationEventSerializer,
+    PreservationOrderSerializer, TitleSerializer, UnbindSerializer,
+    record_preservation_event,
 )
 
 
@@ -47,14 +52,15 @@ class IssueViewSet(viewsets.ModelViewSet):
 class ItemViewSet(viewsets.ModelViewSet):
     queryset = Item.objects.select_related(
         "title", "issue", "binding_entry__binding",
-    ).prefetch_related("issue__numbers")
+    ).prefetch_related("issue__numbers", "preservation_orders")
     serializer_class = ItemSerializer
 
     @action(detail=False, methods=["get"])
     def locate(self, request):
         """按 (title, volume, number) 或 barcode 定位实物。
 
-        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置。
+        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置；
+        保护处理中的实物返回临时位置与处理状态，但发行/条码关系不变。
         """
         title_id = request.query_params.get("title")
         volume = request.query_params.get("volume", "")
@@ -65,19 +71,12 @@ class ItemViewSet(viewsets.ModelViewSet):
             items = self.get_queryset().filter(barcode=barcode)
             result = []
             for it in items:
-                result.append({
-                    "barcode": it.barcode,
-                    "issue_id": it.issue_id,
-                    "numbers": [
-                        {"volume": n.volume, "number": n.number}
-                        for n in it.issue.numbers.all()
-                    ],
-                    "location": it.current_location(),
-                    "bound": it.is_bound,
-                    "binding": it.binding_entry.binding.call_number
-                    if it.is_bound else None,
-                    "status": it.status,
-                })
+                row = item_locate_dict(it, it.issue)
+                row["numbers"] = [
+                    {"volume": n.volume, "number": n.number}
+                    for n in it.issue.numbers.all()
+                ]
+                result.append(row)
             return Response({"query": {"barcode": barcode}, "matches": result})
 
         if not (title_id and number):
@@ -166,7 +165,7 @@ class TimelineViewSet(viewsets.ViewSet):
                             "items",
                             queryset=Item.objects.select_related(
                                 "binding_entry__binding",
-                            ),
+                            ).prefetch_related("preservation_orders"),
                         ),
                     ),
                 ),
@@ -201,10 +200,14 @@ class TimelineViewSet(viewsets.ViewSet):
                                 "item_id": it.id,
                                 "barcode": it.barcode,
                                 "status": it.status,
+                                "serviceable": (
+                                    it.status in Item.SERVICEABLE_STATUSES
+                                ),
                                 "location": it.current_location(),
                                 "bound": it.is_bound,
                                 "binding": it.binding_entry.binding.call_number
                                 if it.is_bound else None,
+                                "preservation": item_preservation_dict(it),
                             }
                             for it in iss.items.all()
                         ],
@@ -216,3 +219,84 @@ class TimelineViewSet(viewsets.ViewSet):
             "title": TitleSerializer(title).data,
             "slots": slots,
         })
+
+
+class PreservationOrderViewSet(viewsets.ModelViewSet):
+    """保护处理单：开单（幂等）、查询、追加处理事件（幂等键+版本）。"""
+
+    queryset = PreservationOrder.objects.select_related(
+        "item", "item__binding_entry__binding",
+    ).prefetch_related("events")
+    serializer_class = PreservationOrderSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        if params.get("title"):
+            qs = qs.filter(item__title_id=params["title"])
+        if params.get("item"):
+            qs = qs.filter(item_id=params["item"])
+        if params.get("barcode"):
+            qs = qs.filter(item__barcode=params["barcode"])
+        if params.get("status"):
+            qs = qs.filter(status=params["status"])
+        if params.get("active") in ("1", "true"):
+            qs = qs.filter(status__in=PreservationOrder.ACTIVE_STATUSES)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        """开单幂等：同一 idempotency_key 重复提交返回原单，不重复建单。"""
+        key = request.data.get("idempotency_key")
+        if key:
+            existing = PreservationOrder.objects.filter(
+                idempotency_key=key,
+            ).first()
+            if existing is not None:
+                return Response({
+                    "duplicate": True,
+                    "order": PreservationOrderSerializer(existing).data,
+                }, status=status.HTTP_200_OK)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                order = serializer.save()
+        except IntegrityError:
+            # 并发下同键撞唯一约束：以先到的单为准
+            order = PreservationOrder.objects.get(idempotency_key=key)
+            return Response({
+                "duplicate": True,
+                "order": PreservationOrderSerializer(order).data,
+            }, status=status.HTTP_200_OK)
+        return Response({
+            "duplicate": False,
+            "order": PreservationOrderSerializer(order).data,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def events(self, request, pk=None):
+        """追加处理事件（交接/评估/完成/返还/报废）。
+
+        - 幂等键重复 → 200，返回原事件，不重复生效；
+        - 事件版本 ≤ 处理单当前版本 → 201 记录审计（applied=false），
+          不覆盖更新后的处置；
+        - 状态机不允许的流转 → 400。
+        """
+        order = self.get_object()
+        serializer = PreservationEventSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        event, outcome = record_preservation_event(
+            order, **serializer.validated_data,
+        )
+        order.refresh_from_db()
+        payload = {
+            "outcome": outcome,
+            "duplicate": outcome == "duplicate",
+            "applied": outcome == "applied",
+            "event": PreservationEventSerializer(event).data,
+            "order": PreservationOrderSerializer(order).data,
+        }
+        if outcome == "duplicate":
+            return Response(payload, status=status.HTTP_200_OK)
+        return Response(payload, status=status.HTTP_201_CREATED)

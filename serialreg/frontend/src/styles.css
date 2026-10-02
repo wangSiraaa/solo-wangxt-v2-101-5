@@ -15,6 +15,8 @@
   --ceased-bg: #eef0f3;
   --combined: #6d3fb0;
   --combined-bg: #f1e9fb;
+  --preserve: #0e6e6b;
+  --preserve-bg: #e0f2f1;
 }
 
 * { box-sizing: border-box; }
@@ -104,6 +106,7 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
 .badge.gap { background: var(--gap-bg); color: var(--gap); }
 .badge.ceased { background: var(--ceased-bg); color: var(--ceased); }
 .badge.combined { background: var(--combined-bg); color: var(--combined); }
+.badge.preserve { background: var(--preserve-bg); color: var(--preserve); }
 
 .msg { font-size: 13px; margin-top: 8px; }
 .msg.err { color: var(--missing); }
@@ -162,6 +165,24 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
   border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
   background: #faf7ff;
 }
+
+/* 保护处理单 */
+.order-card {
+  border: 1px solid var(--preserve);
+  border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
+  background: #f6fbfa;
+}
+.order-card.closed { border-color: var(--line); background: #fafbfc; opacity: .85; }
+.event-log {
+  margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 4px;
+}
+.event-line {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  font-size: 12px; padding: 2px 0;
+}
+.event-line .etype { font-weight: 600; }
+.event-line.stale { opacity: .6; }
+.event-line.stale .etype { text-decoration: line-through; }
 .checks label { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; font-size: 13px; }
 .muted { color: var(--muted); font-size: 12px; }
 .locate-result {

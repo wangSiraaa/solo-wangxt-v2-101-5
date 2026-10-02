@@ -60,4 +60,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
     }),
+
+  listPreservationOrders: (titleId) =>
+    request(titleId ? `/preservation/?title=${titleId}` : "/preservation/"),
+  createPreservationOrder: (payload) =>
+    request("/preservation/", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  addPreservationEvent: (orderId, payload) =>
+    request(`/preservation/${orderId}/events/`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

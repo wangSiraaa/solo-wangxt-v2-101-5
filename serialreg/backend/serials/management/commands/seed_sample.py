@@ -5,7 +5,8 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from serials.models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item,
+    PreservationEvent, PreservationOrder, Title,
 )
 
 
@@ -83,6 +84,31 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 "✓ 装订册 Q/SY-2024：SY-8-34 + SY-8-5 → 装订库 C-12；"
                 "可调用 /api/bindings/unbind/ 拆订恢复原位置"))
+
+        # 5) 保护处理演示：NJ-60-3 受潮 → 待隔离，暂存隔离柜
+        it = Item.objects.get(barcode="NJ-60-3")
+        order, created = PreservationOrder.objects.get_or_create(
+            idempotency_key="seed-preservation-nj-60-3",
+            defaults={
+                "item": it,
+                "cause": PreservationOrder.Cause.WATER,
+                "condition_assessment": "书脊受潮，需干燥去霉",
+                "temporary_location": "隔离柜 Q-1",
+                "restore_location": "现刊区 A-01",
+            },
+        )
+        if created:
+            PreservationEvent.objects.create(
+                order=order,
+                event_type=PreservationEvent.EventType.OPEN,
+                idempotency_key="seed-preservation-nj-60-3:open",
+                version=1, location="隔离柜 Q-1", note="开立保护处理单",
+            )
+            it.status = Item.ItemStatus.QUARANTINE_PENDING
+            it.save(update_fields=["status"])
+            self.stdout.write(self.style.SUCCESS(
+                "✓ 保护处理单 #{}：NJ-60-3 受潮待隔离，暂存隔离柜 Q-1；"
+                "处理期间该期暂时不可取，发行/条码关系不变".format(order.id)))
 
     def _number(self, title, volume, number, sort_key):
         obj, _ = IssueNumber.objects.get_or_create(

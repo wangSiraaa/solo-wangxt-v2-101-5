@@ -56,12 +56,22 @@
 
         <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
           <div style="flex:2;min-width:420px">
-            <TimelineView :data="timeline" @mark-lost="markLost" />
+            <TimelineView
+              :data="timeline"
+              @mark-lost="markLost"
+              @send-preservation="sendPreservation"
+            />
           </div>
           <div style="flex:1;min-width:340px">
             <RegisterForms
               :title-id="currentId"
               :timeline="timeline"
+              @changed="refresh"
+            />
+            <PreservationPanel
+              :title-id="currentId"
+              :timeline="timeline"
+              :preselect-item="preservationItem"
               @changed="refresh"
             />
             <BindingPanel
@@ -78,18 +88,20 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from "vue";
+import { nextTick, onMounted, ref } from "vue";
 import { api } from "./api.js";
 import TimelineView from "./components/TimelineView.vue";
 import LocateBar from "./components/LocateBar.vue";
 import RegisterForms from "./components/RegisterForms.vue";
 import BindingPanel from "./components/BindingPanel.vue";
+import PreservationPanel from "./components/PreservationPanel.vue";
 
 const titles = ref([]);
 const currentId = ref(null);
 const timeline = ref(null);
 const showNewTitle = ref(false);
 const titleMsg = ref(null);
+const preservationItem = ref(null);
 
 const nt = ref({ title: "", issn: "", status: "active", ceased_month: "" });
 
@@ -140,6 +152,12 @@ async function createTitle() {
 async function markLost(itemId) {
   await api.setItemStatus(itemId, "lost");
   await refresh();
+}
+
+// 送修：把时间轴里选中的实物传给保护处理面板预选
+function sendPreservation(itemId) {
+  preservationItem.value = null;
+  nextTick(() => { preservationItem.value = itemId; });
 }
 
 onMounted(refresh);

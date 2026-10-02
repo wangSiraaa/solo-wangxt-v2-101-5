@@ -32,12 +32,20 @@
       </p>
       <div v-for="(m, i) in result.matches" :key="i" class="item-line">
         <code>{{ m.barcode }}</code>
-        <span class="badge" :class="m.status === 'lost' ? 'missing' : 'ok'">
+        <span class="badge" :class="itemBadgeCls(m)">
           {{ itemStatus[m.status] || m.status }}
+        </span>
+        <span v-if="m.preservation" class="badge preserve">
+          {{ causeLabel(m.preservation.cause) }} · 暂时不可取
         </span>
         <span class="loc">
           📍 {{ m.location || "（未排架）" }}
           <template v-if="m.bound">（装订册 {{ m.binding }}）</template>
+        </span>
+        <span v-if="m.preservation" class="muted">
+          处理单 #{{ m.preservation.order_id }}｜临时位置
+          {{ m.preservation.temporary_location || "（未定）" }}｜处理后恢复至
+          {{ m.preservation.restore_location || "（未定）" }}
         </span>
       </div>
     </div>
@@ -47,7 +55,7 @@
 <script setup>
 import { ref } from "vue";
 import { api } from "../api.js";
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import { HOLDING_STATUS, ITEM_STATUS, PRESERVATION_CAUSE } from "../status.js";
 
 const props = defineProps({ titleId: [Number, String] });
 
@@ -62,6 +70,12 @@ function meta(s) {
   return HOLDING_STATUS[s] || { label: s || "未登记", cls: "gap", hint: "" };
 }
 const badgeCls = (s) => meta(s).cls;
+const causeLabel = (c) => PRESERVATION_CAUSE[c] || c;
+function itemBadgeCls(m) {
+  if (m.preservation) return "preserve";
+  if (m.serviceable === false) return "missing";
+  return "ok";
+}
 
 async function byNumber() {
   error.value = "";
@@ -82,8 +96,8 @@ async function byBarcode() {
     const m = data.matches[0];
     result.value = m
       ? {
-          holding_status:
-            m.status === "lost" ? "issued+missing" : "issued+held",
+          // 可服务性以后端判定为准：丢失/报废/保护处理中都算缺藏视图
+          holding_status: m.serviceable ? "issued+held" : "issued+missing",
           matches: [m],
         }
       : { holding_status: "unregistered", matches: [] };

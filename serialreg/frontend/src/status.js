@@ -25,6 +25,42 @@ export const ITEM_STATUS = {
   checked_out: "借出",
   lost: "丢失",
   bound: "已装订",
+  quarantine_pending: "待隔离",
+  in_treatment: "处理中",
+  treatment_done: "处理完成",
+  discarded: "报废",
+};
+
+// 保护处理占用的状态：实物暂时不可服务
+export const PRESERVATION_STATUSES = [
+  "quarantine_pending",
+  "in_treatment",
+  "treatment_done",
+];
+export const isPreservation = (s) => PRESERVATION_STATUSES.includes(s);
+
+export const PRESERVATION_CAUSE = {
+  water: "受潮",
+  pest: "虫害",
+  mold: "霉变",
+  other: "其他",
+};
+
+export const ORDER_STATUS = {
+  quarantine_pending: "待隔离",
+  in_treatment: "处理中",
+  treatment_done: "处理完成",
+  returned: "已返还",
+  discarded: "已报废",
+};
+
+export const EVENT_TYPE = {
+  open: "开立处理单",
+  handover: "交接送出",
+  assess: "条件评估",
+  complete: "处理完成",
+  return: "返还上架",
+  discard: "报废",
 };
 
 export const ISSUE_KIND = { regular: "普通期", combined: "两期合刊" };

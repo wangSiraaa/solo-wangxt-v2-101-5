@@ -16,14 +16,14 @@
     </div>
 
     <div class="checks" style="margin-top:8px">
-      <span class="muted">仅可勾选同一种刊中<b>未装订</b>的实物：</span><br />
+      <span class="muted">仅可勾选同一种刊中<b>未装订且不在保护处理中</b>的实物：</span><br />
       <label v-for="it in unboundItems" :key="it.barcode">
         <input type="checkbox" :value="it.item_pk" v-model="picked" />
         <code>{{ it.barcode }}</code>
         <span class="loc">{{ it.location || "（未排架）" }}</span>
       </label>
       <span v-if="unboundItems.length === 0" class="muted">
-        （暂无可装订实物；已装订实物必须先拆订）
+        （暂无可装订实物；已装订实物必须先拆订，处理中的实物须先返还闭环）
       </span>
     </div>
     <p class="muted" style="margin-top:6px">
@@ -44,6 +44,10 @@
           内含：
           <span v-for="(it, i) in b.items" :key="it.barcode">
             <code>{{ it.barcode }}</code>
+            <span v-if="it.in_preservation" class="badge preserve"
+                  title="该成员正在保护处理，册关系保留，暂位于临时位置">
+              处理中 · 暂存 {{ it.current_location }}
+            </span>
             <span title="装订前位置">原位于 {{ it.previous_location || "（未排架）" }}</span>
             <span v-if="i < b.items.length - 1">；</span>
           </span>
@@ -75,14 +79,15 @@ function notify(text, err = false) {
   setTimeout(() => (msg.value = null), 4000);
 }
 
-// 从时间轴扁平出未装订实物。合刊实物会挂在多个期号槽位下，必须按主键去重。
+// 从时间轴扁平出可装订实物。合刊实物会挂在多个期号槽位下，必须按主键去重；
+// 保护处理中/已报废的实物不可服务，不能装订。
 const unboundItems = computed(() => {
   const seen = new Set();
   const out = [];
   for (const s of props.timeline?.slots || []) {
     for (const iss of s.issues) {
       for (const it of iss.items) {
-        if (it.bound) continue;
+        if (it.bound || it.preservation || it.status === "discarded") continue;
         const pk = it.item_id ?? it.barcode;
         if (seen.has(pk)) continue; // 合刊：同一实物只列一次
         seen.add(pk);

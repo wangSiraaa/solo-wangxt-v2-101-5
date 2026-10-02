@@ -7,9 +7,13 @@
   Item         馆内实物（一条条码=一个实物，不允许一条条码代表多个合刊期号关系）
   Binding      装订册（多个 Item 装订在一起，拆订后 Item 恢复各自位置）
 
+保护处理（受潮/虫害等）：
+  PreservationOrder  保护处理单（一次处置工单，记录原因、评估、临时/恢复位置）
+  PreservationEvent  处理事件（交接/评估/完成/返还/报废，带幂等键与版本）
+
 两条易混的业务规则分开表达：
   缺号 = IssueNumber 没有对应 Issue（没有发行记录），不自动等于缺藏；
-  缺藏 = 该编号已发行（存在 Issue），但没有入库 Item 或 Item 丢失。
+  缺藏 = 该编号已发行（存在 Issue），但没有可用实物（未入藏、丢失或全部在保护处理中）。
 """
 from django.db import models
 from django.db.models import Q
@@ -136,6 +140,24 @@ class Item(models.Model):
         CHECKED_OUT = "checked_out", "借出"
         LOST = "lost", "丢失"
         BOUND = "bound", "已装订"
+        # 保护处理流转状态：只能由保护处理单事件驱动，不能手工 PATCH
+        QUARANTINE_PENDING = "quarantine_pending", "待隔离"
+        IN_TREATMENT = "in_treatment", "处理中"
+        TREATMENT_DONE = "treatment_done", "处理完成"
+        DISCARDED = "discarded", "报废"
+
+    # 保护处理占用的状态：实物不可服务，且不计入「可用副本」
+    PRESERVATION_STATUSES = frozenset({
+        ItemStatus.QUARANTINE_PENDING,
+        ItemStatus.IN_TREATMENT,
+        ItemStatus.TREATMENT_DONE,
+    })
+    # 可服务（可抵消缺藏）的状态；lost/保护处理/报废都不算
+    SERVICEABLE_STATUSES = frozenset({
+        ItemStatus.AVAILABLE,
+        ItemStatus.CHECKED_OUT,
+        ItemStatus.BOUND,
+    })
 
     barcode = models.CharField("条码", max_length=40, unique=True)
     title = models.ForeignKey(
@@ -146,10 +168,11 @@ class Item(models.Model):
         help_text="实物对应的发行期；合刊实物只指向这一个 Issue，"
                   "对多个期号的覆盖由 IssueNumbering 表达",
     )
-    # 未装订时的实际位置；装订后以 binding 的 location 为准
+    # 未装订时的实际位置；装订后以 binding 的 location 为准；
+    # 保护处理期间以处理单的临时位置为准（本字段仍是它的「家」位置）
     location = models.CharField("馆藏位置", max_length=100, blank=True)
     status = models.CharField(
-        "馆藏状态", max_length=12,
+        "馆藏状态", max_length=20,
         choices=ItemStatus.choices, default=ItemStatus.AVAILABLE,
     )
     accessioned_at = models.DateTimeField(auto_now_add=True)
@@ -161,8 +184,35 @@ class Item(models.Model):
     def is_bound(self):
         return hasattr(self, "binding_entry")
 
+    @property
+    def in_preservation(self):
+        return self.status in self.PRESERVATION_STATUSES
+
+    def active_preservation_order(self):
+        """当前进行中的保护处理单（每件实物同时最多一张）。"""
+        for order in self.preservation_orders.all():
+            if order.status in PreservationOrder.ACTIVE_STATUSES:
+                return order
+        return None
+
+    def preservation_display_order(self):
+        """定位/时间轴展示用：进行中的处理单；已报废实物显示其报废单。"""
+        latest_discarded = None
+        for order in self.preservation_orders.all():
+            if order.status in PreservationOrder.ACTIVE_STATUSES:
+                return order
+            if (latest_discarded is None
+                    and order.status == PreservationOrder.OrderStatus.DISCARDED):
+                latest_discarded = order
+        if self.status == Item.ItemStatus.DISCARDED:
+            return latest_discarded
+        return None
+
     def current_location(self):
-        """装订后返回装订册位置，否则返回自身位置。"""
+        """实际位置：保护处理中 → 临时位置；装订后 → 装订册位置；否则自身位置。"""
+        order = self.active_preservation_order()
+        if order is not None and order.temporary_location:
+            return order.temporary_location
         entry = getattr(self, "binding_entry", None)
         if entry is not None:
             return entry.binding.location
@@ -211,11 +261,133 @@ class BindingEntry(models.Model):
             raise ValidationError("装订册内的实物必须属于同一种刊。")
 
 
+class PreservationOrder(models.Model):
+    """保护处理单：一次受潮/虫害等保护处置的工单。
+
+    实物从在馆（或已装订）进入待隔离 → 处理中 → 处理完成，
+    最终返还上架（恢复位置）或报废。处理期间：
+      - 实物不可服务，也不作为可用副本抵消缺藏；
+      - 发行关系、条码、装订关系全部保留，只是位置暂指向临时位置；
+      - 每次交接/评估/返还都写 PreservationEvent，带幂等键与版本。
+    """
+
+    class Cause(models.TextChoices):
+        WATER = "water", "受潮"
+        PEST = "pest", "虫害"
+        MOLD = "mold", "霉变"
+        OTHER = "other", "其他"
+
+    class OrderStatus(models.TextChoices):
+        QUARANTINE_PENDING = "quarantine_pending", "待隔离"
+        IN_TREATMENT = "in_treatment", "处理中"
+        TREATMENT_DONE = "treatment_done", "处理完成"
+        RETURNED = "returned", "已返还"
+        DISCARDED = "discarded", "已报废"
+
+    # 进行中（未闭环）的处理单状态
+    ACTIVE_STATUSES = frozenset({
+        OrderStatus.QUARANTINE_PENDING,
+        OrderStatus.IN_TREATMENT,
+        OrderStatus.TREATMENT_DONE,
+    })
+
+    item = models.ForeignKey(
+        Item, on_delete=models.PROTECT, related_name="preservation_orders",
+        help_text="被处置的实物；发行/条码/装订关系不因处理而改变",
+    )
+    cause = models.CharField(
+        "受损原因", max_length=10, choices=Cause.choices,
+    )
+    status = models.CharField(
+        "处理单状态", max_length=20,
+        choices=OrderStatus.choices, default=OrderStatus.QUARANTINE_PENDING,
+    )
+    condition_assessment = models.TextField("条件评估", blank=True)
+    temporary_location = models.CharField("临时位置", max_length=100, blank=True)
+    restore_location = models.CharField(
+        "恢复位置", max_length=100, blank=True,
+        help_text="处理完成后返还上架的位置；默认取开单时的实际位置",
+    )
+    # 开单时若实物在装订册中，快照册号；BindingEntry 本身全程保留
+    binding_call_number = models.CharField(
+        "处置时所在装订册", max_length=60, blank=True,
+    )
+    # 乐观并发版本：只接受更高版本的事件，迟到事件只记审计不生效
+    version = models.PositiveIntegerField("版本", default=1)
+    idempotency_key = models.CharField("幂等键", max_length=64, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    closed_at = models.DateTimeField("闭环时间", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "保护处理单"
+        ordering = ["-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item"],
+                condition=Q(status__in=[
+                    "quarantine_pending", "in_treatment", "treatment_done",
+                ]),
+                name="unique_active_preservation_order_per_item",
+            ),
+        ]
+
+    def __str__(self):
+        return f"处理单#{self.pk} {self.item.barcode}（{self.get_cause_display()}）"
+
+
+class PreservationEvent(models.Model):
+    """保护处理事件：交接、条件评估、处理完成、返还、报废。
+
+    - idempotency_key：同一处理单内唯一，重复提交不产生第二条事件；
+    - version：事件版本必须高于处理单当前版本才生效，否则只留审计
+      （applied=False），不会覆盖更新后的处置。
+    """
+
+    class EventType(models.TextChoices):
+        OPEN = "open", "开立处理单"
+        HANDOVER = "handover", "交接送出"
+        ASSESS = "assess", "条件评估"
+        COMPLETE = "complete", "处理完成"
+        RETURN = "return", "返还上架"
+        DISCARD = "discard", "报废"
+
+    order = models.ForeignKey(
+        PreservationOrder, on_delete=models.CASCADE, related_name="events",
+    )
+    event_type = models.CharField(
+        "事件类型", max_length=10, choices=EventType.choices,
+    )
+    idempotency_key = models.CharField("幂等键", max_length=64)
+    version = models.PositiveIntegerField("事件版本")
+    applied = models.BooleanField(
+        "已生效", default=True,
+        help_text="False 表示迟到/过期事件：仅保留审计，不改变处置状态",
+    )
+    location = models.CharField(
+        "事件位置", max_length=100, blank=True,
+        help_text="交接时的临时位置 / 返还时的恢复位置",
+    )
+    condition_assessment = models.TextField("条件评估", blank=True)
+    actor = models.CharField("经手人", max_length=60, blank=True)
+    note = models.CharField("备注", max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "保护处理事件"
+        ordering = ["id"]
+        unique_together = ("order", "idempotency_key")
+
+    def __str__(self):
+        return f"{self.get_event_type_display()}@{self.order_id} v{self.version}"
+
+
 def number_holding_status(title, number):
     """计算某个期号的馆藏视图状态。
 
-    issued+held       已发行且有在馆实物（含装订）
-    issued+missing    已发行但缺藏（无实物或全部丢失/借出按调用方再细分）
+    issued+held       已发行且有可服务实物（在馆/借出/已装订）
+    issued+missing    已发行但缺藏（无实物，或实物全部丢失/报废/在保护处理中——
+                      处理中的实物不是可用副本，不能抵消缺藏）
     not_published     缺号：没有任何发行记录，不自动等同缺藏
     ceased_gap        停刊后出现的编号（永远不会有发行）
     """
@@ -226,21 +398,52 @@ def number_holding_status(title, number):
             return "ceased_gap"
         return "not_published"
     items = [it for iss in issues for it in iss.items.all()]
-    held = any(it.status != Item.ItemStatus.LOST for it in items)
+    held = any(it.status in Item.SERVICEABLE_STATUSES for it in items)
     return "issued+held" if held else "issued+missing"
 
 
+def item_preservation_dict(item):
+    """定位/时间轴展示用的保护处理信息；无进行中（或报废）处理单时为 None。"""
+    order = item.preservation_display_order()
+    if order is None:
+        return None
+    return {
+        "order_id": order.id,
+        "status": order.status,
+        "cause": order.cause,
+        "temporary_location": order.temporary_location,
+        "restore_location": order.restore_location,
+        "binding": order.binding_call_number or None,
+        "version": order.version,
+    }
+
+
+def item_locate_dict(item, issue):
+    """定位结果中一个实物的公共视图（期号定位与条码反查共用）。"""
+    return {
+        "issue_id": issue.id,
+        "barcode": item.barcode,
+        "status": item.status,
+        "serviceable": item.status in Item.SERVICEABLE_STATUSES,
+        "location": item.current_location(),
+        "bound": item.is_bound,
+        "binding": item.binding_entry.binding.call_number if item.is_bound else None,
+        "preservation": item_preservation_dict(item),
+    }
+
+
 def locate_number(number):
-    """从任一期号找到其所在实物与实际位置（合刊、装订都可命中）。"""
+    """从任一期号找到其所在实物与实际位置（合刊、装订、保护处理都可命中）。"""
     rows = []
-    for issue in number.issues.all():
-        for item in issue.items.select_related("title"):
-            rows.append({
-                "issue_id": issue.id,
-                "barcode": item.barcode,
-                "status": item.status,
-                "location": item.current_location(),
-                "bound": item.is_bound,
-                "binding": item.binding_entry.binding.call_number if item.is_bound else None,
-            })
+    issues = number.issues.prefetch_related(
+        models.Prefetch(
+            "items",
+            queryset=Item.objects.select_related(
+                "title", "binding_entry__binding",
+            ).prefetch_related("preservation_orders"),
+        ),
+    )
+    for issue in issues:
+        for item in issue.items.all():
+            rows.append(item_locate_dict(item, issue))
     return rows

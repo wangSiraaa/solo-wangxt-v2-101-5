@@ -26,6 +26,10 @@
             <span class="badge" :class="badgeCls(slot.holding_status)">
               {{ statusMeta(slot.holding_status).label }}
             </span>
+            <!-- 缺藏若由保护处理造成，明确提示「暂时不可取」，避免误判为永久缺藏 -->
+            <span v-if="slotPreservation(slot).length" class="badge preserve">
+              {{ slotPreservation(slot).length }} 册保护处理中 · 暂时不可取
+            </span>
             <span class="slot-hint">{{ statusMeta(slot.holding_status).hint }}</span>
           </div>
 
@@ -56,15 +60,27 @@
 
             <div v-for="it in iss.items" :key="it.barcode" class="item-line">
               <code>{{ it.barcode }}</code>
-              <span class="badge" :class="it.status === 'lost' ? 'missing' : 'ok'">
+              <span class="badge" :class="itemBadgeCls(it)">
                 {{ itemStatus[it.status] || it.status }}
+              </span>
+              <span v-if="it.preservation" class="badge preserve">
+                {{ causeLabel(it.preservation.cause) }}
               </span>
               <span class="loc">
                 📍 {{ it.location || "（未排架）" }}
                 <template v-if="it.bound">（装订册 {{ it.binding }}）</template>
+                <template v-if="it.preservation">
+                  <br />处理后恢复至 {{ it.preservation.restore_location || "（未定）" }}
+                </template>
               </span>
               <button
-                v-if="!it.bound && it.status !== 'lost'"
+                v-if="canSendPreservation(it)"
+                class="tiny ghost"
+                @click="$emit('send-preservation', it.item_id)"
+                title="受潮/虫害时开立保护处理单"
+              >送修</button>
+              <button
+                v-if="!it.bound && !it.preservation && it.status !== 'lost' && it.status !== 'discarded'"
                 class="tiny ghost"
                 @click="$emit('mark-lost', it.item_id)"
                 title="标记丢失后，该期变为缺藏"
@@ -78,10 +94,10 @@
 </template>
 
 <script setup>
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import { HOLDING_STATUS, ITEM_STATUS, PRESERVATION_CAUSE } from "../status.js";
 
 defineProps({ data: Object });
-defineEmits(["mark-lost"]);
+defineEmits(["mark-lost", "send-preservation"]);
 const itemStatus = ITEM_STATUS;
 
 const isGap = (s) => s === "not_published" || s === "ceased_gap";
@@ -101,5 +117,28 @@ function monthRange(iss) {
   const a = iss.issue_month?.slice(0, 7);
   const b = iss.issue_month_end?.slice(0, 7);
   return b && b !== a ? `${a} ~ ${b}` : a;
+}
+
+// 槽位内处于保护处理中的实物（用于「暂时不可取」提示）
+function slotPreservation(slot) {
+  const out = [];
+  for (const iss of slot.issues || []) {
+    for (const it of iss.items || []) {
+      if (it.preservation && it.status !== "discarded") out.push(it);
+    }
+  }
+  return out;
+}
+function itemBadgeCls(it) {
+  if (it.preservation) return "preserve";
+  if (it.status === "lost" || it.status === "discarded") return "missing";
+  return "ok";
+}
+function causeLabel(c) {
+  return PRESERVATION_CAUSE[c] || c;
+}
+function canSendPreservation(it) {
+  return !it.preservation
+    && (it.status === "available" || it.status === "bound");
 }
 </script>
