@@ -2,7 +2,9 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, ConservationEvent, ConservationOrder,
+    Issue, IssueNumber, IssueNumbering, Item, Title,
+    item_conservation_summary,
 )
 
 
@@ -130,19 +132,22 @@ class IssueSerializer(serializers.ModelSerializer):
 
 
 class ItemSerializer(serializers.ModelSerializer):
-    """入藏实物。current_location 在装订后取装订册位置。"""
+    """入藏实物。current_location 在装订后取装订册位置、处理中取临时位置。"""
 
     current_location = serializers.SerializerMethodField()
     bound = serializers.SerializerMethodField()
     binding_call_number = serializers.SerializerMethodField()
     number_ids = serializers.SerializerMethodField()
+    serviceable = serializers.SerializerMethodField()
+    active_conservation = serializers.SerializerMethodField()
 
     class Meta:
         model = Item
         fields = [
             "id", "barcode", "title", "issue", "location", "status",
             "accessioned_at", "current_location", "bound",
-            "binding_call_number", "number_ids",
+            "binding_call_number", "number_ids", "serviceable",
+            "active_conservation",
         ]
         read_only_fields: list = []
 
@@ -152,6 +157,23 @@ class ItemSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "已装订状态只能通过装订/拆订操作变更。",
             )
+        # 保护处理状态（含报废）只能由处理单事件驱动
+        if value in Item.CONSERVATION_STATUSES or value == Item.ItemStatus.DISCARDED:
+            raise serializers.ValidationError(
+                "保护处理状态只能通过保护处理单的交接/返还/报废事件变更。",
+            )
+        if self.instance is not None:
+            if self.instance.status == Item.ItemStatus.DISCARDED:
+                raise serializers.ValidationError(
+                    "已报废实体为终态，不能再变更状态。",
+                )
+            order = self.instance.active_conservation_order
+            if order is not None:
+                raise serializers.ValidationError(
+                    f"该实体正在保护处理中（处理单 #{order.id}，"
+                    f"{order.get_status_display()}），不能标记为可服务；"
+                    "请通过处理单的交接/返还事件变更状态。",
+                )
         return value
 
     def get_current_location(self, obj):
@@ -165,6 +187,12 @@ class ItemSerializer(serializers.ModelSerializer):
 
     def get_number_ids(self, obj):
         return list(obj.issue.numbers.values_list("id", flat=True))
+
+    def get_serviceable(self, obj):
+        return obj.is_serviceable
+
+    def get_active_conservation(self, obj):
+        return item_conservation_summary(obj)
 
     def validate(self, attrs):
         title = attrs.get("title", getattr(self.instance, "title", None))
@@ -191,8 +219,10 @@ class BindingSerializer(serializers.ModelSerializer):
         return [
             {
                 "barcode": e.item.barcode,
+                "status": e.item.status,
                 "previous_location": e.previous_location,
-                "current_location": obj.location,
+                "current_location": e.item.current_location(),
+                "conservation": item_conservation_summary(e.item),
             }
             for e in obj.entries.select_related("item")
         ]
@@ -206,6 +236,17 @@ class BindingSerializer(serializers.ModelSerializer):
         if already:
             raise serializers.ValidationError(
                 f"实物已在装订册中：{already}，请先拆订。",
+            )
+        # 保护处理中/已报废的实体不能装订
+        treating = [
+            it.barcode for it in deduped
+            if it.active_conservation_order is not None
+            or it.status in Item.CONSERVATION_STATUSES
+            or it.status == Item.ItemStatus.DISCARDED
+        ]
+        if treating:
+            raise serializers.ValidationError(
+                f"以下实物正在保护处理中或已报废，不能装订：{treating}。",
             )
         return deduped
 
@@ -245,6 +286,18 @@ class UnbindSerializer(serializers.Serializer):
     def save(self, **kwargs):
         binding = self.validated_data["binding_id"]
         entries = list(binding.entries.select_related("item"))
+        # 有成员在保护处理中时禁止拆订：不能静默解除其与册的关系，
+        # 也不能让册内只有部分成员被恢复可用
+        blocked = [
+            e.item.barcode for e in entries
+            if e.item.active_conservation_order is not None
+            or e.item.status in Item.CONSERVATION_STATUSES
+        ]
+        if blocked:
+            raise serializers.ValidationError(
+                f"装订册成员正在保护处理中，不能拆订：{blocked}。"
+                "请先完成处理并返还，再拆订。",
+            )
         for e in entries:
             e.item.location = e.previous_location
             e.item.status = Item.ItemStatus.AVAILABLE
@@ -252,3 +305,92 @@ class UnbindSerializer(serializers.Serializer):
         BindingEntry.objects.filter(binding=binding).delete()
         binding.delete()
         return [e.item for e in entries]
+
+
+# ---------- 保护处理单 ----------
+
+class ConservationEventSerializer(serializers.ModelSerializer):
+    kind_label = serializers.CharField(source="get_kind_display", read_only=True)
+    from_status_label = serializers.CharField(
+        source="get_from_status_display", read_only=True,
+    )
+    to_status_label = serializers.CharField(
+        source="get_to_status_display", read_only=True,
+    )
+
+    class Meta:
+        model = ConservationEvent
+        fields = [
+            "id", "kind", "kind_label", "version",
+            "from_status", "from_status_label", "to_status", "to_status_label",
+            "condition_note", "location", "operator", "note",
+            "idempotency_key", "created_at",
+        ]
+
+
+class ConservationOrderSerializer(serializers.ModelSerializer):
+    """保护处理单详情：含完整事件历史（审计）。"""
+
+    events = ConservationEventSerializer(many=True, read_only=True)
+    item_barcode = serializers.CharField(source="item.barcode", read_only=True)
+    title_id = serializers.IntegerField(source="item.title_id", read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    cause_label = serializers.CharField(source="get_cause_display", read_only=True)
+    active = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ConservationOrder
+        fields = [
+            "id", "item", "item_barcode", "title_id",
+            "cause", "cause_label", "description",
+            "status", "status_label", "active",
+            "temporary_location", "restore_location",
+            "binding", "binding_call_number",
+            "version", "idempotency_key",
+            "opened_at", "updated_at", "closed_at", "events",
+        ]
+
+    def get_active(self, obj):
+        return obj.is_active
+
+
+class ConservationOrderOpenSerializer(serializers.Serializer):
+    """开立保护处理单：实体从在馆/已装订进入待隔离。"""
+
+    item = serializers.PrimaryKeyRelatedField(queryset=Item.objects.all())
+    cause = serializers.ChoiceField(choices=ConservationOrder.Cause.choices)
+    description = serializers.CharField(
+        required=False, allow_blank=True, max_length=255,
+    )
+    temporary_location = serializers.CharField(
+        required=False, allow_blank=True, max_length=100,
+    )
+    restore_location = serializers.CharField(
+        required=False, allow_blank=True, max_length=100,
+    )
+    operator = serializers.CharField(
+        required=False, allow_blank=True, max_length=40,
+    )
+    condition_note = serializers.CharField(required=False, allow_blank=True)
+    idempotency_key = serializers.CharField(max_length=64)
+
+
+class ConservationEventCreateSerializer(serializers.Serializer):
+    """追加处理事件：必须带幂等键与所基于的处理单版本。"""
+
+    kind = serializers.ChoiceField(choices=[
+        c for c in ConservationEvent.Kind.choices
+        if c[0] != ConservationEvent.Kind.OPEN
+    ])
+    idempotency_key = serializers.CharField(max_length=64)
+    version = serializers.IntegerField(min_value=1)
+    condition_note = serializers.CharField(required=False, allow_blank=True)
+    location = serializers.CharField(
+        required=False, allow_blank=True, max_length=100,
+    )
+    operator = serializers.CharField(
+        required=False, allow_blank=True, max_length=40,
+    )
+    note = serializers.CharField(
+        required=False, allow_blank=True, max_length=255,
+    )

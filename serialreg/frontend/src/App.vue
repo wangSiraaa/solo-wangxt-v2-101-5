@@ -64,6 +64,11 @@
               :timeline="timeline"
               @changed="refresh"
             />
+            <ConservationPanel
+              :title-id="currentId"
+              :timeline="timeline"
+              @changed="refresh"
+            />
             <BindingPanel
               :title-id="currentId"
               :timeline="timeline"
@@ -84,6 +89,7 @@ import TimelineView from "./components/TimelineView.vue";
 import LocateBar from "./components/LocateBar.vue";
 import RegisterForms from "./components/RegisterForms.vue";
 import BindingPanel from "./components/BindingPanel.vue";
+import ConservationPanel from "./components/ConservationPanel.vue";
 
 const titles = ref([]);
 const currentId = ref(null);

@@ -15,6 +15,8 @@
   --ceased-bg: #eef0f3;
   --combined: #6d3fb0;
   --combined-bg: #f1e9fb;
+  --treat: #b26a00;
+  --treat-bg: #fff3e0;
 }
 
 * { box-sizing: border-box; }
@@ -104,6 +106,7 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
 .badge.gap { background: var(--gap-bg); color: var(--gap); }
 .badge.ceased { background: var(--ceased-bg); color: var(--ceased); }
 .badge.combined { background: var(--combined-bg); color: var(--combined); }
+.badge.treat { background: var(--treat-bg); color: var(--treat); }
 
 .msg { font-size: 13px; margin-top: 8px; }
 .msg.err { color: var(--missing); }
@@ -168,3 +171,36 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
   margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px;
 }
 code { background: #eef1f5; padding: 0 4px; border-radius: 4px; font-size: 12px; }
+
+/* 保护处理 */
+.conservation-note {
+  flex-basis: 100%;
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--treat);
+  background: var(--treat-bg);
+  border-radius: 0 4px 4px 0;
+  color: var(--treat);
+  font-size: 12px;
+}
+.order-card {
+  border: 1px dashed var(--treat);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: #fffdf8;
+}
+.order-card.closed { border-color: var(--line); background: #fafbfc; }
+.event-list {
+  margin-top: 6px;
+  border-top: 1px dashed var(--line);
+  padding-top: 4px;
+}
+.event-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 2px 0;
+}

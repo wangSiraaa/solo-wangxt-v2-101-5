@@ -11,10 +11,14 @@ async function request(path, options = {}) {
     const detail =
       typeof data === "object" && data
         ? Object.entries(data)
+            .filter(([k]) => k !== "current")
             .map(([k, v]) => `${k}: ${[].concat(v).join("；")}`)
             .join("｜")
         : String(data);
-    throw new Error(detail || `HTTP ${resp.status}`);
+    const err = new Error(detail || `HTTP ${resp.status}`);
+    err.status = resp.status;
+    if (data && data.current) err.current = data.current;
+    throw err;
   }
   return data;
 }
@@ -59,5 +63,23 @@ export const api = {
     request("/bindings/unbind/", {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
+    }),
+
+  listConservation: (params) => {
+    const qs = new URLSearchParams(
+      Object.entries(params || {}).filter(([, v]) => v !== "" && v != null),
+    ).toString();
+    return request(`/conservation/${qs ? `?${qs}` : ""}`);
+  },
+  getConservation: (id) => request(`/conservation/${id}/`),
+  openConservation: (payload) =>
+    request("/conservation/", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  addConservationEvent: (orderId, payload) =>
+    request(`/conservation/${orderId}/events/`, {
+      method: "POST",
+      body: JSON.stringify(payload),
     }),
 };

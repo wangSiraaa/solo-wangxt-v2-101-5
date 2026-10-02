@@ -56,19 +56,35 @@
 
             <div v-for="it in iss.items" :key="it.barcode" class="item-line">
               <code>{{ it.barcode }}</code>
-              <span class="badge" :class="it.status === 'lost' ? 'missing' : 'ok'">
+              <span class="badge" :class="itemBadgeClass(it.status)">
                 {{ itemStatus[it.status] || it.status }}
+              </span>
+              <span v-if="it.serviceable === false" class="badge treat">
+                暂不可取
               </span>
               <span class="loc">
                 📍 {{ it.location || "（未排架）" }}
                 <template v-if="it.bound">（装订册 {{ it.binding }}）</template>
               </span>
               <button
-                v-if="!it.bound && it.status !== 'lost'"
+                v-if="['available', 'checked_out'].includes(it.status)"
                 class="tiny ghost"
                 @click="$emit('mark-lost', it.item_id)"
                 title="标记丢失后，该期变为缺藏"
               >报失</button>
+              <div v-if="it.conservation" class="conservation-note">
+                ⚠ 保护{{ consStatus[it.conservation.status] }}（{{
+                  consCause[it.conservation.cause] }}）· 暂不可取
+                ｜处理单 #{{ it.conservation.order_id }}
+                ｜临时位置：{{ it.conservation.temporary_location || "—" }}
+                ｜处理后恢复至：{{ it.conservation.restore_location || "—" }}
+                <template v-if="it.conservation.binding">
+                  ｜所属装订册 {{ it.conservation.binding }}（册关系保留）
+                </template>
+              </div>
+              <div v-else-if="it.unavailable_reason" class="conservation-note">
+                ⚠ {{ it.unavailable_reason }}
+              </div>
             </div>
           </div>
         </div>
@@ -78,11 +94,16 @@
 </template>
 
 <script setup>
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import {
+  CONSERVATION_CAUSE, CONSERVATION_STATUS, HOLDING_STATUS, ITEM_STATUS,
+  itemBadgeClass,
+} from "../status.js";
 
 defineProps({ data: Object });
 defineEmits(["mark-lost"]);
 const itemStatus = ITEM_STATUS;
+const consStatus = CONSERVATION_STATUS;
+const consCause = CONSERVATION_CAUSE;
 
 const isGap = (s) => s === "not_published" || s === "ceased_gap";
 

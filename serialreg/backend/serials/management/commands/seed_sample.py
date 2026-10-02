@@ -6,6 +6,7 @@ from django.db import transaction
 
 from serials.models import (
     Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    apply_conservation_event, open_conservation_order,
 )
 
 
@@ -83,6 +84,24 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 "✓ 装订册 Q/SY-2024：SY-8-34 + SY-8-5 → 装订库 C-12；"
                 "可调用 /api/bindings/unbind/ 拆订恢复原位置"))
+
+        # 5) 保护处理演示：NJ-60-3 受潮，隔离后送修（处理中）
+        it = Item.objects.get(barcode="NJ-60-3")
+        if not it.conservation_orders.exists():
+            order = open_conservation_order(
+                item=it, cause="damp", description="书页受潮",
+                temporary_location="隔离室 Q-1",
+                idempotency_key="seed-cons-nj603", operator="馆员甲",
+            )
+            apply_conservation_event(
+                order, kind="handover_out",
+                idempotency_key="seed-cons-nj603-ho", version=1,
+                location="修复中心", operator="馆员甲",
+                condition_note="书脊受潮变形，需重新压平",
+            )
+            self.stdout.write(self.style.SUCCESS(
+                f"✓ 保护处理单 #{order.id}：NJ-60-3 受潮送修（处理中），"
+                "临时位置 修复中心，恢复位置 现刊区 A-01"))
 
     def _number(self, title, volume, number, sort_key):
         obj, _ = IssueNumber.objects.get_or_create(

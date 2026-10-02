@@ -7,13 +7,35 @@
   Item         馆内实物（一条条码=一个实物，不允许一条条码代表多个合刊期号关系）
   Binding      装订册（多个 Item 装订在一起，拆订后 Item 恢复各自位置）
 
+保护处理（受潮/虫害送修或隔离）：
+  ConservationOrder   保护处理单：待隔离 → 处理中 → 处理完成 → 已恢复 / 已报废，
+                      带版本号与幂等键；一个实体同一时间最多一张进行中的处理单
+  ConservationEvent   处理事件（交接/状况评估/返还/报废），追加式审计，
+                      幂等键去重、版本号防止迟到事件覆盖更新后的处置
+
 两条易混的业务规则分开表达：
   缺号 = IssueNumber 没有对应 Issue（没有发行记录），不自动等于缺藏；
-  缺藏 = 该编号已发行（存在 Issue），但没有入库 Item 或 Item 丢失。
+  缺藏 = 该编号已发行（存在 Issue），但没有可用 Item（未入藏、丢失或全部在保护处理中）。
 """
 from django.db import models
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.core.exceptions import ValidationError
+from django.utils import timezone
+
+# 处理单「进行中」的状态：实体在这些状态下不可服务、不可装订、不可直接改状态
+CONSERVATION_ACTIVE_STATUSES = ("quarantine", "in_treatment", "completed")
+
+
+class ConservationError(Exception):
+    """保护处理流程的领域错误基类。"""
+
+
+class InvalidTransitionError(ConservationError):
+    """当前状态不允许该操作。"""
+
+
+class StaleVersionError(ConservationError):
+    """事件基于过期的处理单版本（迟到/重复提交），拒绝覆盖更新后的处置。"""
 
 
 class Title(models.Model):
@@ -136,6 +158,21 @@ class Item(models.Model):
         CHECKED_OUT = "checked_out", "借出"
         LOST = "lost", "丢失"
         BOUND = "bound", "已装订"
+        # 保护处理流程状态：只能由处理单事件驱动，不允许直接 PATCH
+        QUARANTINE = "quarantine", "待隔离"
+        IN_TREATMENT = "in_treatment", "处理中"
+        TREATMENT_DONE = "treatment_done", "处理完成"
+        DISCARDED = "discarded", "报废"
+
+    # 馆藏层面「有副本」的状态（缺藏判定用；借出/装订仍算入藏，
+    # 保护处理中与报废不算——处理中的实体不能作为可用副本抵消缺藏）
+    HELD_STATUSES = (
+        ItemStatus.AVAILABLE, ItemStatus.CHECKED_OUT, ItemStatus.BOUND,
+    )
+    # 由保护处理流程驱动的状态，不允许直接 PATCH
+    CONSERVATION_STATUSES = (
+        ItemStatus.QUARANTINE, ItemStatus.IN_TREATMENT, ItemStatus.TREATMENT_DONE,
+    )
 
     barcode = models.CharField("条码", max_length=40, unique=True)
     title = models.ForeignKey(
@@ -146,10 +183,11 @@ class Item(models.Model):
         help_text="实物对应的发行期；合刊实物只指向这一个 Issue，"
                   "对多个期号的覆盖由 IssueNumbering 表达",
     )
-    # 未装订时的实际位置；装订后以 binding 的 location 为准
+    # 未装订时的实际位置；装订后以 binding 的 location 为准；
+    # 保护处理中实际位置以处理单的 temporary_location 为准
     location = models.CharField("馆藏位置", max_length=100, blank=True)
     status = models.CharField(
-        "馆藏状态", max_length=12,
+        "馆藏状态", max_length=16,
         choices=ItemStatus.choices, default=ItemStatus.AVAILABLE,
     )
     accessioned_at = models.DateTimeField(auto_now_add=True)
@@ -161,8 +199,28 @@ class Item(models.Model):
     def is_bound(self):
         return hasattr(self, "binding_entry")
 
+    @property
+    def active_conservation_order(self):
+        """进行中的保护处理单（待隔离/处理中/处理完成），无则 None。"""
+        cached = getattr(self, "_active_conservation_orders", None)
+        if cached is not None:
+            return cached[0] if cached else None
+        return self.conservation_orders.filter(
+            status__in=CONSERVATION_ACTIVE_STATUSES,
+        ).first()
+
+    @property
+    def is_serviceable(self):
+        """读者当前是否可取：在架（含装订册内）且不在保护处理流程中。"""
+        if self.active_conservation_order is not None:
+            return False
+        return self.status in (self.ItemStatus.AVAILABLE, self.ItemStatus.BOUND)
+
     def current_location(self):
-        """装订后返回装订册位置，否则返回自身位置。"""
+        """实际位置：保护处理中取临时位置，装订后取装订册位置，否则取自身位置。"""
+        order = self.active_conservation_order
+        if order is not None and order.temporary_location:
+            return order.temporary_location
         entry = getattr(self, "binding_entry", None)
         if entry is not None:
             return entry.binding.location
@@ -211,11 +269,316 @@ class BindingEntry(models.Model):
             raise ValidationError("装订册内的实物必须属于同一种刊。")
 
 
+class ConservationOrder(models.Model):
+    """保护处理单：实体受潮/虫害等情况下的隔离、送修、返还全流程凭证。
+
+    状态机：待隔离 → 处理中 → 处理完成 → 已恢复（关闭）；任一进行中状态可报废。
+    - version：每次成功应用事件 +1，事件必须携带所基于的版本，迟到事件被拒；
+    - idempotency_key：开立幂等键，重复开立返回同一处理单；
+    - 装订册内实体送修时，binding/binding_call_number 快照保证册关系可追溯，
+      处理动作本身不改动 BindingEntry（不静默拆订）。
+    """
+
+    class Status(models.TextChoices):
+        QUARANTINE = "quarantine", "待隔离"
+        IN_TREATMENT = "in_treatment", "处理中"
+        COMPLETED = "completed", "处理完成"
+        CLOSED = "closed", "已恢复"
+        DISCARDED = "discarded", "已报废"
+
+    class Cause(models.TextChoices):
+        DAMP = "damp", "受潮"
+        PEST = "pest", "虫害"
+        MOLD = "mold", "霉变"
+        DAMAGE = "damage", "破损"
+        OTHER = "other", "其他"
+
+    ACTIVE_STATUSES = CONSERVATION_ACTIVE_STATUSES
+
+    item = models.ForeignKey(
+        Item, on_delete=models.CASCADE, related_name="conservation_orders",
+    )
+    cause = models.CharField("处理原因", max_length=10, choices=Cause.choices)
+    description = models.CharField("情况说明", max_length=255, blank=True)
+    status = models.CharField(
+        "处理单状态", max_length=12,
+        choices=Status.choices, default=Status.QUARANTINE,
+    )
+    temporary_location = models.CharField(
+        "临时位置", max_length=100, blank=True,
+        help_text="隔离/送修期间实体所在位置，定位与时间轴据此展示",
+    )
+    restore_location = models.CharField(
+        "恢复位置", max_length=100, blank=True,
+        help_text="处理完成返还后的去向；默认回原位置（装订册内实体回册位置）",
+    )
+    # 开立时所属装订册快照：处理动作不拆订，册与其他成员关系保持可追溯
+    binding = models.ForeignKey(
+        Binding, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="conservation_orders",
+    )
+    binding_call_number = models.CharField(
+        "所属装订册（快照）", max_length=60, blank=True,
+    )
+    version = models.PositiveIntegerField("版本", default=1)
+    idempotency_key = models.CharField("开立幂等键", max_length=64, unique=True)
+    opened_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    closed_at = models.DateTimeField("办结时间", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "保护处理单"
+        ordering = ["-opened_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item"],
+                condition=Q(status__in=CONSERVATION_ACTIVE_STATUSES),
+                name="uniq_active_conservation_per_item",
+            ),
+        ]
+
+    @property
+    def is_active(self):
+        return self.status in CONSERVATION_ACTIVE_STATUSES
+
+    def __str__(self):
+        return f"处理单#{self.pk} {self.item.barcode}（{self.get_status_display()}）"
+
+
+class ConservationEvent(models.Model):
+    """处理事件（追加式审计）：交接、状况评估、处理完成、返还、报废。
+
+    - idempotency_key 在处理单内唯一：重复提交返回已记录结果，不重复入账；
+    - version 记录事件应用后的处理单版本，形成完整有序历史；
+    - 事件只增不改，处理中途刷新/重启后历史完整可查。
+    """
+
+    class Kind(models.TextChoices):
+        OPEN = "open", "开立处理单"
+        HANDOVER_OUT = "handover_out", "送出交接"
+        ASSESSMENT = "assessment", "状况评估"
+        COMPLETE = "complete", "处理完成"
+        HANDOVER_IN = "handover_in", "返还交接"
+        DISCARD = "discard", "报废"
+
+    order = models.ForeignKey(
+        ConservationOrder, on_delete=models.CASCADE, related_name="events",
+    )
+    kind = models.CharField("事件类型", max_length=15, choices=Kind.choices)
+    idempotency_key = models.CharField("幂等键", max_length=64)
+    version = models.PositiveIntegerField("应用后处理单版本")
+    from_status = models.CharField(
+        "原状态", max_length=12, blank=True,
+        choices=ConservationOrder.Status.choices,
+    )
+    to_status = models.CharField(
+        "新状态", max_length=12, choices=ConservationOrder.Status.choices,
+    )
+    condition_note = models.CharField("状况评估", max_length=255, blank=True)
+    location = models.CharField(
+        "事件后所在位置", max_length=100, blank=True,
+        help_text="交接/评估时实体所在位置，会同步为处理单的临时位置",
+    )
+    operator = models.CharField("经办人", max_length=40, blank=True)
+    note = models.CharField("备注", max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "保护处理事件"
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order", "idempotency_key"],
+                name="uniq_cons_event_key_per_order",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.order_id}#{self.version} {self.get_kind_display()}"
+
+
+# 事件 → 允许的处理单状态迁移（评估不改变状态，只追加审计）
+CONSERVATION_EVENT_TRANSITIONS = {
+    ConservationEvent.Kind.HANDOVER_OUT: {
+        ConservationOrder.Status.QUARANTINE: ConservationOrder.Status.IN_TREATMENT,
+    },
+    ConservationEvent.Kind.ASSESSMENT: {
+        ConservationOrder.Status.QUARANTINE: ConservationOrder.Status.QUARANTINE,
+        ConservationOrder.Status.IN_TREATMENT: ConservationOrder.Status.IN_TREATMENT,
+        ConservationOrder.Status.COMPLETED: ConservationOrder.Status.COMPLETED,
+    },
+    ConservationEvent.Kind.COMPLETE: {
+        ConservationOrder.Status.IN_TREATMENT: ConservationOrder.Status.COMPLETED,
+    },
+    ConservationEvent.Kind.HANDOVER_IN: {
+        # 未送出而解除隔离、处理中直接返还、完成后返还，都归为「已恢复」
+        ConservationOrder.Status.QUARANTINE: ConservationOrder.Status.CLOSED,
+        ConservationOrder.Status.IN_TREATMENT: ConservationOrder.Status.CLOSED,
+        ConservationOrder.Status.COMPLETED: ConservationOrder.Status.CLOSED,
+    },
+    ConservationEvent.Kind.DISCARD: {
+        ConservationOrder.Status.QUARANTINE: ConservationOrder.Status.DISCARDED,
+        ConservationOrder.Status.IN_TREATMENT: ConservationOrder.Status.DISCARDED,
+        ConservationOrder.Status.COMPLETED: ConservationOrder.Status.DISCARDED,
+    },
+}
+
+# 处理单进行中状态 → 实体馆藏状态
+_ORDER_TO_ITEM_STATUS = {
+    ConservationOrder.Status.QUARANTINE: Item.ItemStatus.QUARANTINE,
+    ConservationOrder.Status.IN_TREATMENT: Item.ItemStatus.IN_TREATMENT,
+    ConservationOrder.Status.COMPLETED: Item.ItemStatus.TREATMENT_DONE,
+}
+
+
+def open_conservation_order(item, *, cause, idempotency_key, description="",
+                            temporary_location="", restore_location="",
+                            operator="", condition_note=""):
+    """开立保护处理单：实体进入待隔离。调用方须已持有 item 行锁。"""
+    if item.status not in (Item.ItemStatus.AVAILABLE, Item.ItemStatus.BOUND):
+        raise InvalidTransitionError(
+            f"只有在馆/已装订的实体才能送保护处理（当前："
+            f"{item.get_status_display()}）。"
+        )
+    if item.active_conservation_order is not None:
+        raise InvalidTransitionError("该实体已有进行中的保护处理单。")
+    entry = getattr(item, "binding_entry", None)
+    if not restore_location:
+        # 默认恢复位置：装订册内实体回册位置，散册回原馆藏位置
+        restore_location = entry.binding.location if entry else item.location
+    order = ConservationOrder.objects.create(
+        item=item, cause=cause, description=description,
+        temporary_location=temporary_location,
+        restore_location=restore_location,
+        binding=entry.binding if entry else None,
+        binding_call_number=entry.binding.call_number if entry else "",
+        idempotency_key=idempotency_key,
+    )
+    ConservationEvent.objects.create(
+        order=order, kind=ConservationEvent.Kind.OPEN,
+        idempotency_key=idempotency_key, version=1,
+        from_status="", to_status=ConservationOrder.Status.QUARANTINE,
+        condition_note=condition_note, location=temporary_location,
+        operator=operator,
+    )
+    item.status = Item.ItemStatus.QUARANTINE
+    item.save(update_fields=["status"])
+    return order
+
+
+def apply_conservation_event(order, *, kind, idempotency_key, version,
+                             condition_note="", location="", operator="", note=""):
+    """把事件应用到处理单（调用方须已 select_for_update 锁住处理单）。
+
+    版本不符（迟到/并发）抛 StaleVersionError；状态不允许抛 InvalidTransitionError；
+    两者都不改动任何数据，已入账历史保持不变。
+    """
+    transitions = CONSERVATION_EVENT_TRANSITIONS.get(kind)
+    if transitions is None:
+        raise InvalidTransitionError(f"事件类型不允许直接提交：{kind}")
+    if version != order.version:
+        raise StaleVersionError(
+            f"事件基于版本 v{version}，但处理单已到 v{order.version}"
+            f"（{order.get_status_display()}）；请刷新后按最新版本重试。"
+        )
+    to_status = transitions.get(order.status)
+    if to_status is None:
+        raise InvalidTransitionError(
+            f"处理单当前为「{order.get_status_display()}」，"
+            f"不能执行「{ConservationEvent.Kind(kind).label}」。"
+        )
+    from_status = order.status
+    new_version = order.version + 1
+
+    order.status = to_status
+    order.version = new_version
+    update_fields = ["status", "version", "updated_at"]
+    if location and to_status in CONSERVATION_ACTIVE_STATUSES:
+        # 交接/评估可更新临时位置（如从隔离室转到修复中心）
+        order.temporary_location = location
+        update_fields.append("temporary_location")
+    if to_status in (ConservationOrder.Status.CLOSED,
+                     ConservationOrder.Status.DISCARDED):
+        order.closed_at = timezone.now()
+        update_fields.append("closed_at")
+    order.save(update_fields=update_fields)
+
+    item = order.item
+    if to_status == ConservationOrder.Status.CLOSED:
+        # 返还：装订册内成员恢复为「已装订」（不能局部恢复成散册在馆），
+        # 位置回到处理单记录的恢复位置
+        item.status = (Item.ItemStatus.BOUND if item.is_bound
+                       else Item.ItemStatus.AVAILABLE)
+        if order.restore_location:
+            item.location = order.restore_location
+            item.save(update_fields=["status", "location"])
+        else:
+            item.save(update_fields=["status"])
+    elif to_status == ConservationOrder.Status.DISCARDED:
+        item.status = Item.ItemStatus.DISCARDED
+        item.save(update_fields=["status"])
+    else:
+        item.status = _ORDER_TO_ITEM_STATUS[to_status]
+        item.save(update_fields=["status"])
+
+    return ConservationEvent.objects.create(
+        order=order, kind=kind, idempotency_key=idempotency_key,
+        version=new_version, from_status=from_status, to_status=to_status,
+        condition_note=condition_note, location=location,
+        operator=operator, note=note,
+    )
+
+
+def active_conservation_prefetch():
+    """预取进行中处理单到 _active_conservation_orders，避免逐项查询。"""
+    return Prefetch(
+        "conservation_orders",
+        queryset=ConservationOrder.objects.filter(
+            status__in=CONSERVATION_ACTIVE_STATUSES,
+        ),
+        to_attr="_active_conservation_orders",
+    )
+
+
+def item_conservation_summary(item):
+    """定位/时间轴用的进行中处理单摘要；无则 None。"""
+    order = item.active_conservation_order
+    if order is None:
+        return None
+    return {
+        "order_id": order.id,
+        "status": order.status,
+        "cause": order.cause,
+        "temporary_location": order.temporary_location,
+        "restore_location": order.restore_location,
+        "binding": order.binding_call_number or None,
+        "version": order.version,
+        "opened_at": order.opened_at,
+    }
+
+
+def unavailable_reason(item):
+    """读者视角的不可服务原因；可服务返回 None。"""
+    order = item.active_conservation_order
+    if order is not None:
+        return (f"保护{order.get_status_display()}（{order.get_cause_display()}），"
+                f"暂不可取")
+    if item.status in Item.CONSERVATION_STATUSES:
+        return "保护处理中，暂不可取"
+    if item.status == Item.ItemStatus.CHECKED_OUT:
+        return "借出中"
+    if item.status == Item.ItemStatus.LOST:
+        return "已丢失"
+    if item.status == Item.ItemStatus.DISCARDED:
+        return "已报废"
+    return None
+
+
 def number_holding_status(title, number):
     """计算某个期号的馆藏视图状态。
 
-    issued+held       已发行且有在馆实物（含装订）
-    issued+missing    已发行但缺藏（无实物或全部丢失/借出按调用方再细分）
+    issued+held       已发行且有可用实物（在馆/借出/装订；保护处理中与报废不算）
+    issued+missing    已发行但缺藏（无实物，或实物丢失/报废/全部在保护处理中）
     not_published     缺号：没有任何发行记录，不自动等同缺藏
     ceased_gap        停刊后出现的编号（永远不会有发行）
     """
@@ -226,21 +589,31 @@ def number_holding_status(title, number):
             return "ceased_gap"
         return "not_published"
     items = [it for iss in issues for it in iss.items.all()]
-    held = any(it.status != Item.ItemStatus.LOST for it in items)
+    held = any(it.status in Item.HELD_STATUSES for it in items)
     return "issued+held" if held else "issued+missing"
 
 
+def locate_item_row(item):
+    """单个实物的定位视图：状态、实际位置、可服务性与保护处理信息。"""
+    return {
+        "barcode": item.barcode,
+        "status": item.status,
+        "location": item.current_location(),
+        "bound": item.is_bound,
+        "binding": item.binding_entry.binding.call_number if item.is_bound else None,
+        "serviceable": item.is_serviceable,
+        "unavailable_reason": unavailable_reason(item),
+        "conservation": item_conservation_summary(item),
+    }
+
+
 def locate_number(number):
-    """从任一期号找到其所在实物与实际位置（合刊、装订都可命中）。"""
+    """从任一期号找到其所在实物与实际位置（合刊、装订、保护处理都可命中）。"""
     rows = []
     for issue in number.issues.all():
-        for item in issue.items.select_related("title"):
-            rows.append({
-                "issue_id": issue.id,
-                "barcode": item.barcode,
-                "status": item.status,
-                "location": item.current_location(),
-                "bound": item.is_bound,
-                "binding": item.binding_entry.binding.call_number if item.is_bound else None,
-            })
+        items = issue.items.select_related(
+            "title", "binding_entry__binding",
+        ).prefetch_related(active_conservation_prefetch())
+        for item in items:
+            rows.append({"issue_id": issue.id, **locate_item_row(item)})
     return rows

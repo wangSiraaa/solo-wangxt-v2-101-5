@@ -32,13 +32,27 @@
       </p>
       <div v-for="(m, i) in result.matches" :key="i" class="item-line">
         <code>{{ m.barcode }}</code>
-        <span class="badge" :class="m.status === 'lost' ? 'missing' : 'ok'">
+        <span class="badge" :class="itemBadgeClass(m.status)">
           {{ itemStatus[m.status] || m.status }}
         </span>
+        <span v-if="m.serviceable === false" class="badge treat">暂不可取</span>
         <span class="loc">
           📍 {{ m.location || "（未排架）" }}
           <template v-if="m.bound">（装订册 {{ m.binding }}）</template>
         </span>
+        <div v-if="m.conservation" class="conservation-note">
+          ⚠ 保护{{ consStatus[m.conservation.status] }}（{{
+            consCause[m.conservation.cause] }}）· 暂不可取
+          ｜处理单 #{{ m.conservation.order_id }}
+          ｜临时位置：{{ m.conservation.temporary_location || "—" }}
+          ｜处理后恢复至：{{ m.conservation.restore_location || "—" }}
+          <template v-if="m.conservation.binding">
+            ｜所属装订册 {{ m.conservation.binding }}
+          </template>
+        </div>
+        <div v-else-if="m.unavailable_reason" class="conservation-note">
+          ⚠ {{ m.unavailable_reason }}
+        </div>
       </div>
     </div>
   </div>
@@ -47,7 +61,10 @@
 <script setup>
 import { ref } from "vue";
 import { api } from "../api.js";
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import {
+  CONSERVATION_CAUSE, CONSERVATION_STATUS, HOLDING_STATUS, ITEM_STATUS,
+  itemBadgeClass,
+} from "../status.js";
 
 const props = defineProps({ titleId: [Number, String] });
 
@@ -57,6 +74,8 @@ const barcode = ref("");
 const result = ref(null);
 const error = ref("");
 const itemStatus = ITEM_STATUS;
+const consStatus = CONSERVATION_STATUS;
+const consCause = CONSERVATION_CAUSE;
 
 function meta(s) {
   return HOLDING_STATUS[s] || { label: s || "未登记", cls: "gap", hint: "" };
@@ -83,7 +102,9 @@ async function byBarcode() {
     result.value = m
       ? {
           holding_status:
-            m.status === "lost" ? "issued+missing" : "issued+held",
+            m.status === "lost" || m.status === "discarded" || m.conservation
+              ? "issued+missing"
+              : "issued+held",
           matches: [m],
         }
       : { holding_status: "unregistered", matches: [] };

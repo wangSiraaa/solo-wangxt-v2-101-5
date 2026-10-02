@@ -25,6 +25,43 @@ export const ITEM_STATUS = {
   checked_out: "借出",
   lost: "丢失",
   bound: "已装订",
+  quarantine: "待隔离",
+  in_treatment: "处理中",
+  treatment_done: "处理完成",
+  discarded: "报废",
 };
 
-export const ISSUE_KIND = { regular: "普通期", combined: "两期合刊" };
+// 保护处理单状态（处理完成后还要返还交接才恢复可取）
+export const CONSERVATION_STATUS = {
+  quarantine: "待隔离",
+  in_treatment: "处理中",
+  completed: "处理完成",
+  closed: "已恢复",
+  discarded: "已报废",
+};
+
+export const CONSERVATION_CAUSE = {
+  damp: "受潮",
+  pest: "虫害",
+  mold: "霉变",
+  damage: "破损",
+  other: "其他",
+};
+
+export const CONSERVATION_EVENT = {
+  open: "开立处理单",
+  handover_out: "送出交接",
+  assessment: "状况评估",
+  complete: "处理完成",
+  handover_in: "返还交接",
+  discard: "报废",
+};
+
+// 实体处于保护处理流程中的馆藏状态（不可服务）
+export const IN_CONSERVATION = ["quarantine", "in_treatment", "treatment_done"];
+
+export function itemBadgeClass(status) {
+  if (status === "lost" || status === "discarded") return "missing";
+  if (IN_CONSERVATION.includes(status)) return "treat";
+  return "ok";
+}
